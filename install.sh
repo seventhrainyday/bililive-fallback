@@ -353,16 +353,38 @@ if __name__ == "__main__":
 PYEOF_POSTPROCESS
 chmod +x "$INSTALL_DIR/postprocess.py"
 python3 -m py_compile "$INSTALL_DIR/postprocess.py"
+echo "[ok] 主脚本已安装：$INSTALL_DIR/postprocess.py"
+
+# ---- 配置定时任务：优先用户 crontab，写完必须回读验证；不过则用 /etc/cron.d 兜底 ----
 CRON_LINE='*/5 * * * * /usr/bin/python3 /opt/bililive-fallback/postprocess.py >> /var/log/bililive-fallback.log 2>&1'
+cron_ok=0
 if command -v crontab >/dev/null 2>&1; then
-  ( crontab -l 2>/dev/null | grep -v 'bililive-fallback/postprocess.py' || true; echo "$CRON_LINE" ) | crontab -
-  echo "[ok] cron 已设置：每 5 分钟运行一次（重复安装不会重复添加）"
+  ( crontab -l 2>/dev/null | grep -v 'bililive-fallback/postprocess.py' || true; echo "$CRON_LINE" ) | crontab - || true
+  if crontab -l 2>/dev/null | grep -q 'bililive-fallback/postprocess.py'; then
+    cron_ok=1
+    echo "[ok] cron 已设置并验证通过：每 5 分钟运行一次（重复安装不会重复添加）"
+  else
+    echo "[!] crontab 写入后验证未通过，改用 /etc/cron.d 兜底"
+  fi
 else
-  echo "[!] 未找到 crontab，请手动把下面这行加入定时任务："
+  echo "[!] 未找到 crontab 命令，改用 /etc/cron.d 兜底"
+fi
+if [ "$cron_ok" -ne 1 ]; then
+  if [ -d /etc/cron.d ]; then
+    printf '%s\n' '*/5 * * * * root /usr/bin/python3 /opt/bililive-fallback/postprocess.py >> /var/log/bililive-fallback.log 2>&1' > /etc/cron.d/bililive-fallback
+    chmod 644 /etc/cron.d/bililive-fallback
+    cron_ok=1
+    echo "[ok] 已写入 /etc/cron.d/bililive-fallback"
+  fi
+fi
+if [ "$cron_ok" -ne 1 ]; then
+  echo "[!!] 定时任务自动配置失败，请手动把下面这行加入 crontab -e："
   echo "$CRON_LINE"
 fi
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl is-active cron >/dev/null 2>&1 || systemctl is-active crond >/dev/null 2>&1 || echo "[!] 注意：cron 服务未运行，定时任务不会触发，请执行：systemctl enable --now cron"
+fi
 touch /var/log/bililive-fallback.log 2>/dev/null || true
-echo "[ok] 安装完成：$INSTALL_DIR/postprocess.py"
 echo "手动先跑两遍试试（第一遍只登记，第二遍开始处理已停写30分钟的录像）："
 echo "  python3 $INSTALL_DIR/postprocess.py"
 echo "看日志：tail -f /var/log/bililive-fallback.log"
