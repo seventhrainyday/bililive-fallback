@@ -284,7 +284,25 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False, indent=1)
 
 
+def acquire_lock():
+    """单实例锁：已有实例在跑就直接退出，避免 cron 与手动运行/双调度入口并发撞车。"""
+    lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             ".postprocess.lock")
+    f = open(lock_path, "w")
+    try:
+        import fcntl
+    except ImportError:
+        return f  # 非 Unix 平台不做锁（本脚本面向 Linux）
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("已有另一个 postprocess 实例在运行，本次跳过", flush=True)
+        sys.exit(0)
+    return f  # 保持引用不被 GC，进程退出时自动释放
+
+
 def main():
+    _lock = acquire_lock()
     cfg = read_bililive_config()
     state = load_state()
     now = time.time()
