@@ -242,7 +242,9 @@ def find_existing_fixed(flv_path):
     体积不足原文件 25% 的产物多半是修复被中断的残件，删掉重修。
     """
     stem = os.path.splitext(flv_path)[0]
-    hits = sorted(glob.glob(stem + ".fix_p*.flv"))
+    # 注意：录像文件名含方括号（如 [2026-10-13 00-26-07][SH—五缘湾]…），
+    # glob 会把 [] 当成字符类导致永远匹配不到，必须先 escape。
+    hits = sorted(glob.glob(glob.escape(stem) + ".fix_p*.flv"))
     fixed_fallback = stem + ".fixed.flv"
     if os.path.isfile(fixed_fallback):
         hits.append(fixed_fallback)

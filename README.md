@@ -76,3 +76,12 @@ python3 /opt/bililive-fallback/postprocess.py
 crontab -l | grep -v 'bililive-fallback/postprocess.py' | crontab -
 rm -rf /opt/bililive-fallback /var/log/bililive-fallback.log
 ```
+
+## 更新日志
+
+- 2026-10-13：修复断点续跑在方括号文件名下失效的 bug。录像文件名含 `[]`
+  （如 `[2026-10-13 00-26-07][SH—五缘湾]…`），`find_existing_fixed` 用
+  `glob.glob(stem + ".fix_p*.flv")` 查找旧产物时，`[]` 会被 glob 当成字符类，
+  永远匹配不到真实文件，导致每轮重复修复并报 `already exists` 死循环。
+  改为 `glob.escape(stem)` 后转义，已用真实带方括号文件名测试复用/残件删除/
+  无产物三条路径通过。
