@@ -36,6 +36,13 @@ curl -fsSL https://raw.githubusercontent.com/seventhrainyday/bililive-fallback/m
 装到 `/opt/bililive-fallback/postprocess.py`，并自动添加每 5 分钟
 运行一次的 cron（重复安装不会重复添加）。
 
+**断点续跑**：某轮在上传阶段失败会留下修复/转换产物；下一轮先
+检查并复用已有产物（跳过修复/转换、直达上传），不会从头重来。
+这是必需的：BililiveRecorder 的 fix 拒绝覆盖已存在的输出文件，
+从头重来会报 `already exists` 并永远卡在第一步。体积不足原文件
+25% 的旧产物视为残件、删掉重修；扫描时中间产物（`.fix_p*.flv`、
+`.fixed.flv`）不会被当成新录像。
+
 **cron 缺失时自动安装**：检测不到 `crontab` 命令时，安装脚本会按
 发行版自动安装并启动 cron 服务（apt→`cron`、dnf/yum→`cronie`、
 apk→`cronie`/`dcron`、pacman→`cronie`、zypper→`cron`；systemd 与
