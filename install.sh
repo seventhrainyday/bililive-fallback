@@ -240,6 +240,42 @@ def render_target(platform, host_name, file_name):
 
 # ------------------------- 单场录像处理 -------------------------
 
+def find_existing_fixed(flv_path):
+    """查找上次运行留下的修复产物（断点续跑用）。
+
+    BililiveRecorder 的 fix 拒绝覆盖已存在的输出文件：若上一轮在上传
+    阶段失败、留下了 .fix_p001.flv，本轮再从修复重来会直接报
+    「already exists」并永远卡在第一步。因此处理前先找旧产物复用。
+    体积不足原文件 25% 的产物多半是修复被中断的残件，删掉重修。
+    """
+    stem = os.path.splitext(flv_path)[0]
+    hits = sorted(glob.glob(stem + ".fix_p*.flv"))
+    fixed_fallback = stem + ".fixed.flv"
+    if os.path.isfile(fixed_fallback):
+        hits.append(fixed_fallback)
+    if not hits:
+        return []
+    try:
+        src_size = os.path.getsize(flv_path)
+    except OSError:
+        src_size = 0
+    good = []
+    for h in hits:
+        try:
+            sz = os.path.getsize(h)
+        except OSError:
+            sz = 0
+        if src_size and sz < src_size * 0.25:
+            log(f"  发现残缺的旧修复产物，删除重修: {os.path.basename(h)}")
+            try:
+                os.remove(h)
+            except OSError:
+                pass
+        else:
+            good.append(h)
+    return good
+
+
 def process_recording(flv_path, cfg, ol):
     rel = os.path.relpath(flv_path, SCAN_ROOT)
     parts = rel.split(os.sep)
@@ -247,10 +283,22 @@ def process_recording(flv_path, cfg, ol):
     host_name = parts[1] if len(parts) >= 3 else ""
     log(f"开始处理: {rel}")
 
-    fixed_files = fix_flv(flv_path)
+    # 断点续跑：有上次的修复产物就跳过修复（录播姬 fix 不覆盖已有文件，
+    # 从头重来会报 already exists 并无限卡在第一步）
+    fixed_files = find_existing_fixed(flv_path)
+    if fixed_files:
+        log(f"  跳过修复，复用上次产物: "
+            f"{[os.path.basename(f) for f in fixed_files]}")
+    else:
+        fixed_files = fix_flv(flv_path)
     mp4s = []
     for ff in fixed_files:
-        mp4s.append(convert_mp4(ff))
+        mp4 = os.path.splitext(ff)[0] + ".mp4"
+        if os.path.isfile(mp4) and os.path.getsize(mp4) > 0:
+            log(f"  跳过转换，复用上次产物: {os.path.basename(mp4)}")
+            mp4s.append(mp4)
+        else:
+            mp4s.append(convert_mp4(ff))
 
     storage = cfg["storage"]
     if not storage:
@@ -320,8 +368,13 @@ def main():
         if os.sep + "." in dirpath[len(SCAN_ROOT):]:
             continue
         for name in files:
-            if name.lower().endswith(".flv"):
-                candidates.append(os.path.join(dirpath, name))
+            if not name.lower().endswith(".flv"):
+                continue
+            # 跳过后处理中间产物，避免把修复产物当成新录像重复处理
+            low = name.lower()
+            if ".fix_p" in low or low.endswith(".fixed.flv"):
+                continue
+            candidates.append(os.path.join(dirpath, name))
 
     ready = []
     for path in candidates:
