@@ -1,0 +1,64 @@
+# bililive-fallback
+
+bililive-go 后处理兜底脚本：解决 bililive-go（v0.8.3）录制结束后
+**修复 FLV / 转 MP4 / 自动上传全部不执行**的问题。
+
+## 问题根因
+
+bililive-go 的录制器（`src/recorders/recorder.go`）在 `ParseLiveStream`
+返回 error 时直接 `return`，其后的全部后处理都被跳过。而 ffmpeg 解析器的
+`Stop()` 有一个 3 秒强杀逻辑：下播时先给 ffmpeg 写 `q` 请求优雅退出，
+3 秒内不退就 `Kill()`。抖音等平台下播后 CDN 连接不关闭、流卡死，
+ffmpeg 堵在网络读里不响应 `q`，于是每次正常下播都会被强杀 →
+`failed to parse live stream: signal: killed` → 后处理永远不跑，
+flv 完好地留在盘上无人处理。
+
+## 本脚本做什么
+
+与 bililive 解耦，定时扫描录像目录，对「停写满 30 分钟、且连续两次
+扫描大小不变」的 `.flv` 执行与 bililive 内置流水线相同的动作：
+
+1. **FLV 修复**：调用 bililive 已下载的 BililiveRecorder 工具
+   （与内置 fix_flv 同一工具同一命令），找不到时退回 ffmpeg 重封装
+2. **转 MP4**：`ffmpeg -c copy -movflags +faststart`（与内置 convert_mp4 一致）
+3. **上传**：调用本机 OpenList API 传到 bililive 配置里的存储与路径模板
+4. **清理**：上传成功后删除本地源文件与中间产物
+
+OpenList 的账号、密码、端口、存储名都自动从 bililive 的 `config.yml`
+读取，无需再配一遍。
+
+## 一键安装
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/seventhrainyday/bililive-fallback/main/install.sh | bash
+```
+
+装到 `/opt/bililive-fallback/postprocess.py`，并自动添加每 5 分钟
+运行一次的 cron（重复安装不会重复添加）。
+
+手动运行（第一遍只登记，第二遍开始处理）：
+
+```bash
+python3 /opt/bililive-fallback/postprocess.py
+```
+
+日志：`/var/log/bililive-fallback.log`
+
+## 可调参数
+
+脚本顶部常量，按需修改：
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `SCAN_ROOT` | `/root` | 录像输出根目录（bililive 的启动目录） |
+| `BILILIVE_CONFIG` | `/etc/bililive-go/config.yml` | bililive 配置文件路径 |
+| `MIN_AGE_SECONDS` | `1800` | flv 停写多久后才处理（安全阀，避免碰正在录/正在被 bililive 处理的文件） |
+| `UPLOAD_PATH_TMPL` | 与 bililive 配置一致 | 上传路径模板 |
+| `DELETE_AFTER_UPLOAD` | `True` | 上传成功后删本地文件 |
+
+## 卸载
+
+```bash
+crontab -l | grep -v 'bililive-fallback/postprocess.py' | crontab -
+rm -rf /opt/bililive-fallback /var/log/bililive-fallback.log
+```
