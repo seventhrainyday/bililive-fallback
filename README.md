@@ -36,6 +36,13 @@ curl -fsSL https://raw.githubusercontent.com/seventhrainyday/bililive-fallback/m
 装到 `/opt/bililive-fallback/postprocess.py`，并自动添加每 5 分钟
 运行一次的 cron（重复安装不会重复添加）。
 
+**cron 缺失时自动安装**：检测不到 `crontab` 命令时，安装脚本会按
+发行版自动安装并启动 cron 服务（apt→`cron`、dnf/yum→`cronie`、
+apk→`cronie`/`dcron`、pacman→`cronie`、zypper→`cron`；systemd 与
+OpenRC 均支持）。定时任务写入后会回读验证，验证不过改写
+`/etc/cron.d/bililive-fallback` 兜底。主脚本带单实例锁，
+重复调度不会并发处理同一文件。
+
 手动运行（第一遍只登记，第二遍开始处理）：
 
 ```bash
