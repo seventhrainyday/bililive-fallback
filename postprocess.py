@@ -122,6 +122,19 @@ class OpenList:
             if r.get("code") != 200 and r.get("message") != "file exists":
                 log(f"  mkdir {cur} 返回: {r.get('code')} {r.get('message')}")
 
+    def exists(self, remote_path):
+        """云端是否存在该文件（孤儿清理前的二次确认）。
+
+        任何异常（网络不通、API 报错）都返回 False，即：无法确认时
+        绝不删除本地文件。
+        """
+        try:
+            r = self._json_req("POST", "/api/fs/get",
+                               {"path": remote_path, "password": ""})
+        except Exception:
+            return False
+        return r.get("code") == 200
+
     def upload(self, local_path, remote_path):
         size = os.path.getsize(local_path)
         # File-Path 头：逐段 URL 编码，保留 /
@@ -310,6 +323,13 @@ def process_recording(flv_path, cfg, ol):
 
     if DELETE_AFTER_UPLOAD:
         victims = set([flv_path] + fixed_files + mp4s)
+        # 孤儿清理：bililive-go 官方流水线转出的同名 mp4（无 .fix_p 后缀），
+        # 因其上传失败而遗留；本场已上传成功、云端有副本，可一并删除。
+        # 文件名含 []，glob 前必须 escape（2026-10-13 修过的同类 bug）。
+        stem = os.path.splitext(flv_path)[0]
+        for orphan in sorted(glob.glob(glob.escape(stem) + ".mp4")):
+            if ".fix_p" not in os.path.basename(orphan).lower():
+                victims.add(orphan)
         for v in victims:
             try:
                 os.remove(v)
@@ -349,6 +369,61 @@ def acquire_lock():
         print("已有另一个 postprocess 实例在运行，本次跳过", flush=True)
         sys.exit(0)
     return f  # 保持引用不被 GC，进程退出时自动释放
+
+
+# ------------------------- 孤儿 mp4 扫描 -------------------------
+
+def sweep_orphans(cfg, ol):
+    """清理 bililive-go 官方流水线遗留的孤儿 mp4。
+
+    官方流水线转出 [原名].mp4 后若上传失败会留下该文件；其 flv 可能
+    已被删（官方 convert 后删 flv、或兜底脚本处理完），此时正常流程
+    永远碰不到它。删除条件（缺一不可）：
+      1. 文件名不含 .fix_p（不是我们的产物）；
+      2. 同目录下已没有对应的 .flv（有 flv 的走 process_recording 顺手清理）；
+      3. 停写超过 MIN_AGE_SECONDS（排除正在转码/写入中的）；
+      4. 云端已存在我们上传的 [原名].fix_p001.mp4（二次确认，有副本才敢删）。
+    第 4 条查不到/查失败的一律保留，宁可占磁盘也不丢数据。
+    """
+    storage = cfg.get("storage") or ""
+    if not storage:
+        return
+    now = time.time()
+    for dirpath, _dirs, files in os.walk(SCAN_ROOT):
+        # 跳过 .appdata 等隐藏目录
+        if os.sep + "." in dirpath[len(SCAN_ROOT):]:
+            continue
+        for name in files:
+            low = name.lower()
+            if not low.endswith(".mp4") or ".fix_p" in low:
+                continue
+            mp4_path = os.path.join(dirpath, name)
+            stem = os.path.splitext(mp4_path)[0]
+            if os.path.exists(stem + ".flv"):
+                continue  # 有 flv，走正常流程
+            try:
+                st = os.stat(mp4_path)
+            except OSError:
+                continue
+            if st.st_size == 0 or now - st.st_mtime < MIN_AGE_SECONDS:
+                continue
+            rel = os.path.relpath(mp4_path, SCAN_ROOT)
+            parts = rel.split(os.sep)
+            platform = parts[0] if len(parts) >= 3 else ""
+            host_name = parts[1] if len(parts) >= 3 else ""
+            remote = "/" + storage + render_target(
+                platform, host_name, os.path.basename(stem) + ".fix_p001.mp4")
+            try:
+                has_copy = ol.exists(remote)
+            except Exception:
+                continue  # 查不到就当无副本，保留
+            if has_copy:
+                try:
+                    os.remove(mp4_path)
+                    log(f"  已删除孤儿文件（云端已有副本）: {mp4_path}")
+                except OSError:
+                    pass
+            # 查不到副本的一律保留，不打日志避免每 5 分钟刷屏
 
 
 def main():
@@ -396,14 +471,19 @@ def main():
     save_state(state)
 
     if not ready:
-        return
+        log("本轮无待处理录像")
 
+    # OpenList 登录提前：孤儿扫描也要调 API；失败则整轮跳过（软着陆，
+    # 日志里留一行，比 traceback 好查）
     ol = OpenList(cfg["port"], cfg.get("token", ""))
-    if cfg.get("username") and cfg.get("password"):
-        ol.login(cfg["username"], cfg["password"])
-    elif not ol.token:
-        log("错误：既无 OpenList token 也无账号密码，无法上传")
-        sys.exit(1)
+    try:
+        if cfg.get("username") and cfg.get("password"):
+            ol.login(cfg["username"], cfg["password"])
+        elif not ol.token:
+            raise RuntimeError("既无 OpenList token 也无账号密码")
+    except Exception as e:
+        log(f"OpenList 不可用，跳过本轮上传与孤儿扫描: {e}")
+        return
 
     for path in ready:
         try:
@@ -412,6 +492,12 @@ def main():
             save_state(state)
         except Exception as e:
             log(f"处理失败（下次重试）: {path} - {e}")
+
+    # 孤儿扫描：flv 已不在、仅剩官方转出的 mp4，且云端已有我们上传的版本
+    try:
+        sweep_orphans(cfg, ol)
+    except Exception as e:
+        log(f"孤儿扫描失败（不影响主流程）: {e}")
 
 
 if __name__ == "__main__":
