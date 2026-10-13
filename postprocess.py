@@ -284,11 +284,60 @@ def find_existing_fixed(flv_path):
     return good
 
 
-def process_recording(flv_path, cfg, ol):
-    rel = os.path.relpath(flv_path, SCAN_ROOT)
+# 我们产出的 mp4 文件名模式：BililiveRecorder 路径 -> .fix_p001.mp4，
+# ffmpeg 兜底路径 -> .fixed.mp4。mp4 重试扫描与孤儿扫描靠它区分“自家产物”。
+OUR_MP4_RE = re.compile(r"\.(fix_p\d+|fixed)\.mp4$", re.IGNORECASE)
+
+
+def original_stem_of(mp4_path):
+    """从自家 mp4 路径反推出原始录像 stem（去掉 .fix_p001 / .fixed 后缀）。"""
+    return OUR_MP4_RE.sub("", mp4_path)
+
+
+def clean_orphans(original_stem):
+    """删除 bililive-go 官方流水线遗留的同名孤儿 mp4（转出后上传失败留下的）。
+
+    只删不带我们后缀的 [原名].mp4；文件名含 []，glob 前必须 escape。
+    """
+    n = 0
+    for orphan in sorted(glob.glob(glob.escape(original_stem) + ".mp4")):
+        if OUR_MP4_RE.search(orphan):
+            continue
+        try:
+            os.remove(orphan)
+            log(f"  已删除孤儿文件: {orphan}")
+            n += 1
+        except OSError:
+            pass
+    return n
+
+
+def upload_one_mp4(mp4_path, cfg, ol):
+    """上传单个 mp4（flv 流程与 mp4 重试扫描共用）。"""
+    rel = os.path.relpath(mp4_path, SCAN_ROOT)
     parts = rel.split(os.sep)
     platform = parts[0] if len(parts) >= 3 else ""
     host_name = parts[1] if len(parts) >= 3 else ""
+    storage = cfg.get("storage") or ""
+    if not storage:
+        raise RuntimeError("未从 bililive 配置读到 storage_name，无法上传")
+    target = render_target(platform, host_name, os.path.basename(mp4_path))
+    remote = "/" + storage + target
+    remote_dir = remote.rsplit("/", 1)[0]
+    log(f"  上传: {os.path.basename(mp4_path)} -> {remote}")
+    ol.mkdir_recursive(remote_dir)
+    ol.upload(mp4_path, remote)
+    log(f"  上传成功: {remote}")
+
+
+def process_recording(flv_path, cfg, ol):
+    """处理单场录像：修复 -> 转 mp4 -> 删 flv（只留 mp4）-> 上传。
+
+    flv 在转出有效 mp4 后、上传前就删除（用户 2026-10-13 要求只保留 mp4，
+    省磁盘）。上传失败不抛异常：mp4 留在盘上，由每轮的 mp4 重试扫描接手。
+    返回本轮经手的 mp4 列表（供 main 登记，避免同轮重复上传）。
+    """
+    rel = os.path.relpath(flv_path, SCAN_ROOT)
     log(f"开始处理: {rel}")
 
     # 断点续跑：有上次的修复产物就跳过修复（录播姬 fix 不覆盖已有文件，
@@ -308,35 +357,69 @@ def process_recording(flv_path, cfg, ol):
         else:
             mp4s.append(convert_mp4(ff))
 
-    storage = cfg["storage"]
-    if not storage:
-        raise RuntimeError("未从 bililive 配置读到 storage_name，无法上传")
-
+    # mp4 有效才敢删 flv：转换失败则原样保留，下轮重试（不丢录像）
     for mp4 in mp4s:
-        target = render_target(platform, host_name, os.path.basename(mp4))
-        remote = "/" + storage + target
-        remote_dir = remote.rsplit("/", 1)[0]
-        log(f"  上传: {os.path.basename(mp4)} -> {remote}")
-        ol.mkdir_recursive(remote_dir)
-        ol.upload(mp4, remote)
-        log(f"  上传成功: {remote}")
+        if not (os.path.isfile(mp4) and os.path.getsize(mp4) > 0):
+            raise RuntimeError(f"转换产物无效，保留 flv 待下轮重试: {mp4}")
+    for v in set([flv_path] + fixed_files):
+        try:
+            os.remove(v)
+            log(f"  已删除中间文件: {v}")
+        except OSError:
+            pass
 
-    if DELETE_AFTER_UPLOAD:
-        victims = set([flv_path] + fixed_files + mp4s)
-        # 孤儿清理：bililive-go 官方流水线转出的同名 mp4（无 .fix_p 后缀），
-        # 因其上传失败而遗留；本场已上传成功、云端有副本，可一并删除。
-        # 文件名含 []，glob 前必须 escape（2026-10-13 修过的同类 bug）。
-        stem = os.path.splitext(flv_path)[0]
-        for orphan in sorted(glob.glob(glob.escape(stem) + ".mp4")):
-            if ".fix_p" not in os.path.basename(orphan).lower():
-                victims.add(orphan)
-        for v in victims:
+    original_stem = os.path.splitext(flv_path)[0]
+    for mp4 in mp4s:
+        try:
+            upload_one_mp4(mp4, cfg, ol)
+        except Exception as e:
+            log(f"  上传失败（mp4 保留，靠重试扫描）: "
+                f"{os.path.basename(mp4)} - {e}")
+            continue
+        if DELETE_AFTER_UPLOAD:
             try:
-                os.remove(v)
-                log(f"  已删除本地文件: {v}")
+                os.remove(mp4)
+                log(f"  已删除本地文件: {mp4}")
             except OSError:
                 pass
+            clean_orphans(original_stem)
     log(f"处理完成: {rel}")
+    return mp4s
+
+
+def retry_pending_mp4s(cfg, ol, skip):
+    """重试此前上传失败留下的自家 mp4（flv 已按新流程提前删除）。
+
+    skip：本轮 flv 流程已上传过（无论成败）的 mp4，避免同轮重复撞网关。
+    """
+    for dirpath, _dirs, files in os.walk(SCAN_ROOT):
+        # 跳过 .appdata 等隐藏目录
+        if os.sep + "." in dirpath[len(SCAN_ROOT):]:
+            continue
+        for name in files:
+            if not OUR_MP4_RE.search(name):
+                continue
+            mp4_path = os.path.join(dirpath, name)
+            if mp4_path in skip:
+                continue
+            try:
+                if os.path.getsize(mp4_path) == 0:
+                    continue
+            except OSError:
+                continue
+            log(f"重试上传上轮遗留: {os.path.relpath(mp4_path, SCAN_ROOT)}")
+            try:
+                upload_one_mp4(mp4_path, cfg, ol)
+            except Exception as e:
+                log(f"  重试失败（下轮继续）: {e}")
+                continue
+            if DELETE_AFTER_UPLOAD:
+                try:
+                    os.remove(mp4_path)
+                    log(f"  已删除本地文件: {mp4_path}")
+                except OSError:
+                    pass
+                clean_orphans(original_stem_of(mp4_path))
 
 
 # ------------------------- 状态与主循环 -------------------------
@@ -394,8 +477,7 @@ def sweep_orphans(cfg, ol):
         if os.sep + "." in dirpath[len(SCAN_ROOT):]:
             continue
         for name in files:
-            low = name.lower()
-            if not low.endswith(".mp4") or ".fix_p" in low:
+            if not name.lower().endswith(".mp4") or OUR_MP4_RE.search(name):
                 continue
             mp4_path = os.path.join(dirpath, name)
             stem = os.path.splitext(mp4_path)[0]
@@ -485,13 +567,20 @@ def main():
         log(f"OpenList 不可用，跳过本轮上传与孤儿扫描: {e}")
         return
 
+    handled_mp4s = set()
     for path in ready:
         try:
-            process_recording(path, cfg, ol)
+            handled_mp4s.update(process_recording(path, cfg, ol))
             state[path] = {"done": True, "size": 0, "sightings": 99}
             save_state(state)
         except Exception as e:
-            log(f"处理失败（下次重试）: {path} - {e}")
+            log(f"处理失败（下轮重试）: {path} - {e}")
+
+    # 重试此前上传失败留下的自家 mp4（flv 已提前删除，不走 flv 流程）
+    try:
+        retry_pending_mp4s(cfg, ol, handled_mp4s)
+    except Exception as e:
+        log(f"mp4 重试扫描失败（不影响主流程）: {e}")
 
     # 孤儿扫描：flv 已不在、仅剩官方转出的 mp4，且云端已有我们上传的版本
     try:
