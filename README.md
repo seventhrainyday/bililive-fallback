@@ -83,6 +83,10 @@ rm -rf /opt/bililive-fallback /var/log/bililive-fallback.log
 
 ## 更新日志
 
+- 2026-10-13：修复 install.sh 内嵌旧版 postprocess.py 的严重问题。之前
+  install.sh 把整个脚本 heredoc 内嵌在自己体内、并非从仓库下载，导致
+  glob.escape 修复与孤儿清理 push 后用户重装也拿不到新代码、白白卡了
+  16 小时。现改为安装时从仓库实时下载 `postprocess.py`，单一真相源。
 - 2026-10-13：新增孤儿 mp4 清理。bililive-go 官方流水线转出 `[原名].mp4`
   后若上传失败会留下该文件（flv 可能已被删），正常流程永远碰不到。两处处理：
   ① 单场录像上传成功后，顺手删除同场孤儿 mp4；② 每轮新增兜底扫描
